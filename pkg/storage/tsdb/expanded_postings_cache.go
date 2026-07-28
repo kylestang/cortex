@@ -37,12 +37,14 @@ const (
 )
 
 type ExpandedPostingsCacheMetrics struct {
-	CacheRequests       *prometheus.CounterVec
-	CacheHits           *prometheus.CounterVec
-	CacheEvicts         *prometheus.CounterVec
-	CacheMiss           *prometheus.CounterVec
-	NonCacheableQueries *prometheus.CounterVec
-	LazyMatcherQueries  prometheus.Counter
+	CacheRequests                   *prometheus.CounterVec
+	CacheHits                       *prometheus.CounterVec
+	CacheEvicts                     *prometheus.CounterVec
+	CacheMiss                       *prometheus.CounterVec
+	NonCacheableQueries             *prometheus.CounterVec
+	LazyMatcherQueries              prometheus.Counter
+	SampledInvalidations            *prometheus.CounterVec
+	SampledUnnecessaryInvalidations *prometheus.CounterVec
 }
 
 func NewPostingCacheMetrics(r prometheus.Registerer) *ExpandedPostingsCacheMetrics {
@@ -71,6 +73,14 @@ func NewPostingCacheMetrics(r prometheus.Registerer) *ExpandedPostingsCacheMetri
 			Name: "cortex_ingester_expanded_postings_lazy_matcher_queries_total",
 			Help: "Total number of queries that used lazy matcher evaluation on cache miss.",
 		}),
+		SampledInvalidations: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_ingester_expanded_postings_cache_sampled_invalidations_total",
+			Help: "Sampled count of cache entries refetched due to label-count invalidation. Denominator for the unnecessary-invalidation ratio used to tune label-counter-size.",
+		}, []string{"cache"}),
+		SampledUnnecessaryInvalidations: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_ingester_expanded_postings_cache_sampled_unnecessary_invalidations_total",
+			Help: "Sampled subset of invalidations where the refetched postings were identical to the cached ones, i.e. the invalidation was unnecessary (hash collision or over-broad label keying). A high ratio to sampled_invalidations suggests increasing label-counter-size.",
+		}, []string{"cache"}),
 	}
 }
 
@@ -311,8 +321,15 @@ func (c *blocksPostingsForMatchersCache) fetchPostings(blockID ulid.ULID, ix tsd
 		return nil, 0, stillValid, err
 	}
 
+	// Only the head cache performs count invalidation, so only sample there. ExpandPostings
+	// returns sorted SeriesRefs, so slices.Equal is a valid identity check.
+	var equalValue func(old, updated []storage.SeriesRef) bool
+	if isHead {
+		equalValue = slices.Equal[[]storage.SeriesRef]
+	}
+
 	key := cacheKey(blockID, ms...)
-	promise, loaded := cache.getPromiseForKey(key, fetch)
+	promise, loaded := cache.getPromiseForKey(key, fetch, equalValue)
 	if loaded {
 		c.metrics.CacheHits.WithLabelValues(cache.name).Inc()
 	}
@@ -542,12 +559,21 @@ func (s *labelCounter) increment(userId string, dimensions ...string) {
 	s.counts[i].Add(1)
 }
 
+// invalidationSampleRate controls how often an invalidation refetch compares the old and
+// new postings to detect unnecessary invalidations. 1-in-N keeps the O(len) comparison off
+// the common path while still yielding a usable ratio.
+const invalidationSampleRate = 100
+
 type lruCache[V any] struct {
 	cfg          PostingsCacheConfig
 	cachedValues *sync.Map
 	timeNow      func() time.Time
 	name         string
 	metrics      ExpandedPostingsCacheMetrics
+
+	// invalidationCounter is incremented on every invalidation refetch; every
+	// invalidationSampleRate-th one triggers an equality sample. Atomic, no lock needed.
+	invalidationCounter atomic.Uint64
 
 	// Fields from here should be locked
 	cachedMtx   sync.RWMutex
@@ -598,7 +624,10 @@ func (c *lruCache[V]) size() int {
 	return c.cached.Len()
 }
 
-func (c *lruCache[V]) getPromiseForKey(k string, fetch func() (V, int64, func() bool, error)) (*cacheEntryPromise[V], bool) {
+// equalValue, when non-nil, is used to sample whether an invalidation refetch produced the
+// same value it replaced (an unnecessary invalidation). Nil disables sampling (blocks cache,
+// tests).
+func (c *lruCache[V]) getPromiseForKey(k string, fetch func() (V, int64, func() bool, error), equalValue func(old, updated V) bool) (*cacheEntryPromise[V], bool) {
 	r := &cacheEntryPromise[V]{
 		done: make(chan struct{}),
 	}
@@ -645,6 +674,17 @@ func (c *lruCache[V]) getPromiseForKey(k string, fetch func() (V, int64, func() 
 			}
 			r.v, r.sizeBytes, r.stillValid, r.err = fetch()
 			r.sizeBytes += int64(len(k))
+
+			// Sample a fraction of invalidations to detect unnecessary ones (refetch produced
+			// the same postings), which indicate hash collisions or over-broad label keying
+			// and help tune label-counter-size. Only when the fetch succeeded.
+			if invalidated && equalValue != nil && r.err == nil &&
+				c.invalidationCounter.Add(1)%invalidationSampleRate == 0 {
+				c.metrics.SampledInvalidations.WithLabelValues(c.name).Inc()
+				if equalValue(loaded.(*cacheEntryPromise[V]).v, r.v) {
+					c.metrics.SampledUnnecessaryInvalidations.WithLabelValues(c.name).Inc()
+				}
+			}
 			c.updateSize(loaded.(*cacheEntryPromise[V]).sizeBytes, r.sizeBytes)
 			r.ts = c.timeNow()
 			// Replace the list element: remove old, push new to back

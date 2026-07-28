@@ -70,7 +70,7 @@ func Test_ShouldFetchPromiseOnlyOnce(t *testing.T) {
 	for range 100 {
 		go func() {
 			defer wg.Done()
-			cache.getPromiseForKey("key1", fetchFunc)
+			cache.getPromiseForKey("key1", fetchFunc, nil)
 		}()
 	}
 
@@ -87,7 +87,7 @@ func TestFifoCacheDisabled(t *testing.T) {
 	cache := newLruCache[int](cfg, "test", m, timeNow)
 	old, loaded := cache.getPromiseForKey("key1", func() (int, int64, func() bool, error) {
 		return 1, 0, nil, nil
-	})
+	}, nil)
 	require.False(t, loaded)
 	require.Equal(t, 1, old.v)
 	require.False(t, cache.contains("key1"))
@@ -133,13 +133,13 @@ func TestFifoCacheExpire(t *testing.T) {
 				key := RepeatStringIfNeeded(fmt.Sprintf("key%d", i), keySize)
 				p, loaded := cache.getPromiseForKey(key, func() (int, int64, func() bool, error) {
 					return 1, 8, nil, nil
-				})
+				}, nil)
 				require.False(t, loaded)
 				require.Equal(t, 1, p.v)
 				require.True(t, cache.contains(key))
 				p, loaded = cache.getPromiseForKey(key, func() (int, int64, func() bool, error) {
 					return 1, 0, nil, nil
-				})
+				}, nil)
 				require.True(t, loaded)
 				require.Equal(t, 1, p.v)
 			}
@@ -175,7 +175,7 @@ func TestFifoCacheExpire(t *testing.T) {
 					originalSize := cache.cachedBytes
 					p, loaded := cache.getPromiseForKey(key, func() (int, int64, func() bool, error) {
 						return 2, 18, nil, nil
-					})
+					}, nil)
 					require.False(t, loaded)
 					// New value
 					require.Equal(t, 2, p.v)
@@ -197,7 +197,7 @@ func TestFifoCacheExpire(t *testing.T) {
 
 				cache.getPromiseForKey("newKwy", func() (int, int64, func() bool, error) {
 					return 2, 18, nil, nil
-				})
+				}, nil)
 
 				// Should expire all keys expired keys
 				err = testutil.GatherAndCompare(r, bytes.NewBufferString(fmt.Sprintf(`
@@ -306,19 +306,19 @@ func TestLruCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	cache := newLruCache[int](cfg, "test", m, time.Now)
 
 	// Insert 3 entries: A, B, C
-	cache.getPromiseForKey("aaaa", func() (int, int64, func() bool, error) { return 1, 8, nil, nil })
-	cache.getPromiseForKey("bbbb", func() (int, int64, func() bool, error) { return 2, 8, nil, nil })
-	cache.getPromiseForKey("cccc", func() (int, int64, func() bool, error) { return 3, 8, nil, nil })
+	cache.getPromiseForKey("aaaa", func() (int, int64, func() bool, error) { return 1, 8, nil, nil }, nil)
+	cache.getPromiseForKey("bbbb", func() (int, int64, func() bool, error) { return 2, 8, nil, nil }, nil)
+	cache.getPromiseForKey("cccc", func() (int, int64, func() bool, error) { return 3, 8, nil, nil }, nil)
 
 	require.True(t, cache.contains("aaaa"))
 	require.True(t, cache.contains("bbbb"))
 	require.True(t, cache.contains("cccc"))
 
 	// Access A to make it recently used (B is now least recently used)
-	cache.getPromiseForKey("aaaa", func() (int, int64, func() bool, error) { return 1, 8, nil, nil })
+	cache.getPromiseForKey("aaaa", func() (int, int64, func() bool, error) { return 1, 8, nil, nil }, nil)
 
 	// Insert D — should evict B (least recently used), not A
-	cache.getPromiseForKey("dddd", func() (int, int64, func() bool, error) { return 4, 8, nil, nil })
+	cache.getPromiseForKey("dddd", func() (int, int64, func() bool, error) { return 4, 8, nil, nil }, nil)
 
 	require.True(t, cache.contains("aaaa"), "A should still be cached (recently accessed)")
 	require.False(t, cache.contains("bbbb"), "B should be evicted (least recently used)")
@@ -346,7 +346,7 @@ func BenchmarkLruCacheHitUnderPressure(b *testing.B) {
 	hotKeys := make([]string, 50)
 	for i := range hotKeys {
 		hotKeys[i] = RepeatStringIfNeeded(fmt.Sprintf("hot-%d", i), keySize)
-		cache.getPromiseForKey(hotKeys[i], func() (int, int64, func() bool, error) { return i, 8, nil, nil })
+		cache.getPromiseForKey(hotKeys[i], func() (int, int64, func() bool, error) { return i, 8, nil, nil }, nil)
 	}
 
 	coldIdx := 0
@@ -356,12 +356,12 @@ func BenchmarkLruCacheHitUnderPressure(b *testing.B) {
 		if i%3 == 0 {
 			// 1/3 of accesses are hot queries (simulating ruler every 30s)
 			key := hotKeys[i%len(hotKeys)]
-			cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return 1, 8, nil, nil })
+			cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return 1, 8, nil, nil }, nil)
 		} else {
 			// 2/3 are cold unique queries (ad-hoc from Grafana)
 			key := RepeatStringIfNeeded(fmt.Sprintf("cold-%d", coldIdx), keySize)
 			coldIdx++
-			cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return 1, 8, nil, nil })
+			cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return 1, 8, nil, nil }, nil)
 		}
 	}
 
@@ -384,14 +384,14 @@ func BenchmarkCacheGetPromise(b *testing.B) {
 	// Pre-populate 1000 keys
 	for i := range 1000 {
 		key := fmt.Sprintf("key-%04d", i)
-		cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return i, 100, nil, nil })
+		cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return i, 100, nil, nil }, nil)
 	}
 
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
 			key := fmt.Sprintf("key-%04d", i%1000)
-			cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return 1, 100, nil, nil })
+			cache.getPromiseForKey(key, func() (int, int64, func() bool, error) { return 1, 100, nil, nil }, nil)
 			i++
 		}
 	})
@@ -633,4 +633,34 @@ func TestSnapshotCounts_Size(t *testing.T) {
 			require.Equal(t, tt.expectedSize, size)
 		})
 	}
+}
+
+func TestExpandedPostingsCache_SamplesUnnecessaryInvalidations(t *testing.T) {
+	// The mock always returns the same postings, so every invalidation is "unnecessary".
+	// Driving invalidationSampleRate invalidations must produce exactly one sample, and
+	// because the postings never change that sample must be flagged unnecessary.
+	reg := prometheus.NewPedanticRegistry()
+	m := NewPostingCacheMetrics(reg)
+	labelCounter := newLabelCounter(labelCounterArraySize)
+	cfg := TSDBPostingsCacheConfig{
+		Head: PostingsCacheConfig{Enabled: true, Ttl: time.Hour, MaxBytes: 10 << 20},
+		PostingsForMatchers: func(ctx context.Context, ix tsdb.IndexReader, ms ...*labels.Matcher) (index.Postings, error) {
+			return index.NewListPostings([]storage.SeriesRef{1, 2, 3}), nil
+		},
+	}
+	cache := newBlocksPostingsForMatchersCache("user1", cfg, m, labelCounter)
+	nameMatcher := labels.MustNewMatcher(labels.MatchEqual, "__name__", "http_requests")
+
+	// Populate the entry, then force exactly invalidationSampleRate invalidations by bumping
+	// the metric's count before each query so stillValid fails every time.
+	query(t, cache, nameMatcher)
+	for range invalidationSampleRate {
+		cache.ExpireSeries(labels.FromStrings("__name__", "http_requests"))
+		query(t, cache, nameMatcher)
+	}
+
+	require.Equal(t, float64(1), testutil.ToFloat64(m.SampledInvalidations.WithLabelValues("head")),
+		"one sample should be taken per invalidationSampleRate invalidations")
+	require.Equal(t, float64(1), testutil.ToFloat64(m.SampledUnnecessaryInvalidations.WithLabelValues("head")),
+		"identical refetched postings must be flagged unnecessary")
 }
